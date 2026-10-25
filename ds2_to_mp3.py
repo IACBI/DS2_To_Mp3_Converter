@@ -23,6 +23,8 @@ import os
 import sys
 import time
 import glob
+import traceback
+import unicodedata
 from pathlib import Path
 from typing import List, Optional
 
@@ -31,9 +33,49 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
 from ds2_decoder import (
-    DS2Decoder, DS2Header, parse_ds2_header, encode_pcm_to_mp3,
+    DS2Decoder, DS2Header, parse_ds2_header, encode_pcm_to_mp3, write_wav,
     DS2_MAGIC, DS2_HEADER_SIZE
 )
+
+
+_ESCAPED_CATEGORIES = frozenset({'Cc', 'Cf', 'Zl', 'Zp', 'Co', 'Cs'})
+
+
+def _escape_char(c: str) -> str:
+    code = ord(c)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def sanitize_for_terminal(text: str) -> str:
+    """
+    Escape control, format and separator characters before printing.
+
+    DS2 header strings are untrusted. Beyond C0/C1 controls, bidi overrides and
+    zero-width characters (Cf) can reorder or hide text, and line/paragraph
+    separators (Zl, Zp) can break a line. Private-use and surrogate code points
+    (Co, Cs) are escaped too so they cannot render as arbitrary glyphs.
+    """
+    return ''.join(
+        _escape_char(c) if unicodedata.category(c) in _ESCAPED_CATEGORIES else c
+        for c in text
+    )
+
+
+def use_lenient_console_streams() -> None:
+    """
+    Keep stdout/stderr encodings, but replace characters they cannot encode.
+
+    The banner uses box-drawing characters, which raise UnicodeEncodeError on
+    cp1252/cp1254 consoles and in piped output with a legacy code page.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure is not None:
+            reconfigure(errors='replace')
 
 
 def find_ds2_files(path: str) -> List[str]:
@@ -101,7 +143,7 @@ def convert_file(ds2_path: str, output_dir: str, bitrate: int = 128,
         with open(ds2_path, 'rb') as f:
             magic = f.read(4)
         if magic != DS2_MAGIC:
-            print(f"  ✗ {filename}: Not a valid DS2 file (magic: {magic.hex()})")
+            print(f"  ✗ {sanitize_for_terminal(filename)}: Not a valid DS2 file (magic: {magic.hex()})")
             return None
         
         # Parse header for info
@@ -111,9 +153,11 @@ def convert_file(ds2_path: str, output_dir: str, bitrate: int = 128,
         file_size = len(data)
         
         mode_str = "QP" if header.codec_mode >= 6 else "SP"
-        print(f"  → {filename}")
-        print(f"    Device: {header.device_model} | Author: {header.author or 'N/A'}")
-        print(f"    Date: {header.creation_datetime} | Duration: {header.duration_str}")
+        print(f"  → {sanitize_for_terminal(filename)}")
+        print(f"    Device: {sanitize_for_terminal(header.device_model)} | "
+              f"Author: {sanitize_for_terminal(header.author or 'N/A')}")
+        print(f"    Date: {sanitize_for_terminal(header.creation_datetime)} | "
+              f"Duration: {sanitize_for_terminal(header.duration_str)}")
         print(f"    Mode: {mode_str} ({header.sample_rate}Hz) | Frames: {header.total_frames}")
         print(f"    Size: {file_size:,} bytes | Bitrate: ~{file_size * 8 / max(header.duration_seconds, 1) / 1000:.1f} kbps")
         
@@ -143,18 +187,22 @@ def convert_file(ds2_path: str, output_dir: str, bitrate: int = 128,
               f"({len(samples):,} samples)")
         print(f"    ✓ Encoded to MP3 ({bitrate}kbps, 44.1kHz) → {mp3_size:,} bytes")
         print(f"    ✓ Time: {total_time:.1f}s (decode={decode_time:.1f}s, encode={encode_time:.1f}s)")
-        print(f"    ✓ Output: {mp3_path}")
-        
+        print(f"    ✓ Output: {sanitize_for_terminal(mp3_path)}")
+
         return mp3_path
-        
+
     except Exception as e:
-        print(f"  ✗ {filename}: ERROR - {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  ✗ {sanitize_for_terminal(filename)}: ERROR - {sanitize_for_terminal(str(e))}")
+        # No verbose flag exists, so the traceback is printed sanitized. Line breaks
+        # are split on '\n' only, so they are kept while other characters are escaped.
+        trace = traceback.format_exc().split('\n')
+        print('\n'.join(sanitize_for_terminal(line) for line in trace), file=sys.stderr)
         return None
 
 
 def main():
+    use_lenient_console_streams()
+
     parser = argparse.ArgumentParser(
         description='DS2 to MP3 Converter — Convert Olympus DS2 dictation files to MP3',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -230,23 +278,18 @@ Examples:
         print(f"\n[{i}/{len(ds2_files)}] Processing...")
         
         if args.wav:
-            import wave as wave_mod
             filename = os.path.basename(ds2_path)
             wav_name = Path(filename).stem + '_converted.wav'
             wav_path = os.path.join(output_dir, wav_name)
-            
+
             try:
                 decoder = DS2Decoder(codebook_dir=codebook_dir)
                 samples, header = decoder.decode_file(ds2_path)
-                with wave_mod.open(wav_path, 'w') as w:
-                    w.setnchannels(1)
-                    w.setsampwidth(2)
-                    w.setframerate(decoder.sample_rate)
-                    w.writeframes(samples.tobytes())
-                print(f"  ✓ {filename} → {wav_name}")
+                write_wav(wav_path, samples, decoder.sample_rate)
+                print(f"  ✓ {sanitize_for_terminal(filename)} → {sanitize_for_terminal(wav_name)}")
                 results.append(wav_path)
             except Exception as e:
-                print(f"  ✗ {filename}: {e}")
+                print(f"  ✗ {sanitize_for_terminal(filename)}: {sanitize_for_terminal(str(e))}")
         else:
             result = convert_file(ds2_path, output_dir, args.bitrate, codebook_dir)
             if result:
