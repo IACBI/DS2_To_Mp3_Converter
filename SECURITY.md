@@ -4,10 +4,11 @@
 
 Please report security issues privately. Do not open a public issue for them.
 
-Use GitHub's **Report a vulnerability** button on the repository's **Security** tab
-(https://github.com/IACBI/DS2_To_Mp3_Converter/security/advisories/new). Include the
-steps to reproduce, the affected version or commit, and, if possible, a small sample
-file that triggers the problem.
+Use GitHub's **Report a vulnerability** button on the repository's **Security** tab, or
+open the advisory form directly at
+https://github.com/IACBI/DS2_To_Mp3_Converter/security/advisories/new. Include the steps
+to reproduce, the affected version or commit, and, if possible, a small sample file that
+triggers the problem.
 
 ## Scope
 
