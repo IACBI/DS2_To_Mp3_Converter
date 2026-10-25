@@ -16,7 +16,7 @@ DS2 (Digital Speech Standard Pro) is a highly compressed speech format used by p
 - **Zero Binaries**: No ffmpeg, libav, or DLLs required for the core decoding process.
 
 ### Installation
-Ensure you have Python 3.8+ installed.
+Ensure you have Python 3.12+ installed.
 ```bash
 pip install -r requirements.txt
 ```
@@ -32,6 +32,8 @@ python ds2_to_mp3.py ./my_recordings/
 python ds2_to_mp3.py recording.DS2
 ```
 
+Run the tests with `pip install -r requirements-dev.txt` followed by `python -m pytest`.
+
 ---
 
 ## 🇹🇷 Türkçe Versiyon
@@ -46,7 +48,7 @@ DS2 (Digital Speech Standard Pro), profesyonel dikte cihazları (Olympus, Philip
 - **Kurulumsuz Kullanım**: Dışarıdan .exe veya .dll dosyası gerektirmez.
 
 ### Kurulum
-Python 3.8+ yüklü olduğundan emin olun.
+Python 3.12 veya daha yeni bir sürümün yüklü olduğundan emin olun.
 ```bash
 pip install -r requirements.txt
 ```
@@ -61,6 +63,8 @@ python ds2_to_mp3.py ./ses_kayitlarim/
 ```powershell
 python ds2_to_mp3.py kayit.DS2
 ```
+
+Testleri çalıştırmak için `pip install -r requirements-dev.txt` ardından `python -m pytest` komutlarını kullanın.
 
 ---
 
