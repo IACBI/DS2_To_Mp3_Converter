@@ -22,6 +22,8 @@ Dependencies: numpy, lameenc, mutagen
 """
 
 import math
+import secrets
+import stat
 import struct
 import wave
 import os
@@ -41,6 +43,10 @@ DS2_MAGIC = b'\x03ds2'
 DS2_HEADER_SIZE = 0x600  # 1536 bytes
 DS2_BLOCK_SIZE = 512     # Each audio data block
 DS2_BLOCK_HEADER_SIZE = 6  # Per-block header bytes
+
+# Upper bound on decoded audio length. Frame counts come from untrusted block
+# headers, so this bounds decode work even when the payload is large enough.
+MAX_AUDIO_SECONDS = 12 * 3600
 
 # --- SP Mode (Standard Play) constants ---
 SP_SAMPLE_RATE = 12000
@@ -332,6 +338,46 @@ class BitstreamReader:
 # DS2 Demuxer
 # =============================================================================
 
+def _sp_packet_bytes(total_frames: int, first_swap: int) -> int:
+    """Payload bytes the SP demuxer consumes for total_frames packets.
+
+    Swap frames take 40 bytes and no-swap frames take 42, alternating from first_swap.
+    """
+    swap_frames = (total_frames + 1) // 2 if first_swap else total_frames // 2
+    return ((DSS_SP_PACKET_SIZE - 2) * swap_frames
+            + DSS_SP_PACKET_SIZE * (total_frames - swap_frames))
+
+
+def _sp_frames_supported(available_bytes: int, first_swap: int) -> int:
+    # One trailing partial frame is tolerated because the decoder zero-fills it.
+    limit = available_bytes + DSS_SP_PACKET_SIZE
+    lo, hi = 0, limit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _sp_packet_bytes(mid, first_swap) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _qp_frames_supported(available_bytes: int) -> int:
+    # Same one-partial-frame tolerance as _sp_frames_supported.
+    return available_bytes // (QP_FRAME_BITS // 8) + 1
+
+
+def _warn_clamped_frames(declared: int, usable: int) -> None:
+    if usable < declared:
+        print(f"  Warning: DS2 header declares {declared} frames but the payload holds "
+              f"{usable}; decoding {usable} frames")
+
+
+def _check_duration_cap(total_frames: int, sample_rate: int,
+                        samples_per_frame: int) -> None:
+    if total_frames * samples_per_frame > MAX_AUDIO_SECONDS * sample_rate:
+        raise ValueError(f"DS2 audio exceeds the {MAX_AUDIO_SECONDS}-second decode limit")
+
+
 def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
     """
     Read DS2 file and extract audio frame data.
@@ -361,6 +407,13 @@ def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
     for bi in range(num_blocks):
         total_frames += data[DS2_HEADER_SIZE + bi * DS2_BLOCK_SIZE + 2]
 
+    # Frame counts are untrusted. The duration cap rejects outright; the per-segment
+    # and SP totals below are clamped to what the payload can hold.
+    if format_type >= 6:
+        _check_duration_cap(total_frames, QP_SAMPLE_RATE, QP_SAMPLES_PER_FRAME)
+    else:
+        _check_duration_cap(total_frames, SP_SAMPLE_RATE, SP_SAMPLES_PER_FRAME)
+
     if format_type >= 6:
         # QP mode: continuous bitstream, segmented by recording pauses
         segments = []
@@ -387,7 +440,15 @@ def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
         if current_stream:
             segments.append((bytes(current_stream), current_frames))
             
-        return segments, total_frames, 'qp'
+        usable_segments = []
+        usable_total = 0
+        for stream, seg_frames in segments:
+            usable = min(seg_frames, _qp_frames_supported(len(stream)))
+            usable_segments.append((stream, usable))
+            usable_total += usable
+        _warn_clamped_frames(total_frames, usable_total)
+
+        return usable_segments, usable_total, 'qp'
     else:
         # SP mode: byte-swap alternation demuxing
         
@@ -398,6 +459,9 @@ def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
             
         # Initialize swap state from bit 7 of first block's byte0
         swap = (data[DS2_HEADER_SIZE] >> 7) & 1
+        usable_frames = min(total_frames, _sp_frames_supported(len(stream), swap))
+        _warn_clamped_frames(total_frames, usable_frames)
+        total_frames = usable_frames
         swap_byte = 0
         pos = 0
         frame_packets: List[bytes] = []
@@ -410,7 +474,9 @@ def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
                 # then shift even-indexed bytes
                 read_size = 40
                 end = min(pos + read_size, len(stream))
-                pkt[3:3 + (end - pos)] = stream[pos:end]
+                # Clamp: a negative length would shrink pkt and crash the shift below
+                n = max(0, end - pos)
+                pkt[3:3 + n] = stream[pos:pos + n]
                 pos += read_size
 
                 # Shift even-indexed bytes: pkt[i] = pkt[i+4] for i in 0,2,4,...,40
@@ -422,7 +488,8 @@ def demux_ds2(data: bytes) -> Tuple[Any, int, str]:
                 # No-swap frame: read 42 bytes directly
                 read_size = DSS_SP_PACKET_SIZE
                 end = min(pos + read_size, len(stream))
-                pkt[:end - pos] = stream[pos:end]
+                n = max(0, end - pos)
+                pkt[:n] = stream[pos:pos + n]
                 pos += read_size
                 swap_byte = pkt[DSS_SP_PACKET_SIZE - 2]
 
@@ -666,11 +733,11 @@ class DS2Decoder:
         header = parse_ds2_header(data)
         frame_data, total_frames, detected_mode = demux_ds2(data)
 
-        # Switch mode if file doesn't match
+        # Switch mode if file doesn't match. demux_ds2 does not depend on the decoder
+        # state, so its result is reused rather than demuxing (and warning) again.
         if detected_mode != self.mode:
             self.__init__(detected_mode,
                          os.path.dirname(os.path.abspath(__file__)))
-            frame_data, total_frames, detected_mode = demux_ds2(data)
 
         self.reset()
 
@@ -680,7 +747,7 @@ class DS2Decoder:
         else:
             all_samples = self._decode_sp_frames(frame_data, total_frames)
 
-        samples_arr = np.array(all_samples, dtype=np.float64)
+        samples_arr = np.asarray(all_samples, dtype=np.float64)
 
         # QP mode: apply de-emphasis filter y[n] = x[n] + 0.1*y[n-1]
         if self.mode == 'qp':
@@ -694,14 +761,16 @@ class DS2Decoder:
         return samples_16, header
 
     def _decode_sp_frames(self, frame_packets: List[bytes],
-                          total_frames: int) -> List[float]:
+                          total_frames: int) -> np.ndarray:
         """Decode SP frames from byte-swap demuxed packets."""
-        all_samples: List[float] = []
+        # Preallocated once; frames are written in place. Failed frames stay silent.
+        out = np.empty(total_frames * self.samples_per_frame, dtype=np.float64)
         cb_bits = math.ceil(math.log2(
             math.comb(self.subframe_size, self.excitation_pulses)
         ))
 
         for fi in range(total_frames):
+            frame_out = out[fi * self.samples_per_frame:(fi + 1) * self.samples_per_frame]
             try:
                 reader = BitstreamReader(frame_packets[fi])
 
@@ -732,16 +801,19 @@ class DS2Decoder:
                     self.pitch_delta_range, self.num_subframes
                 )
                 samples = self._synthesize_frame(refl_indices, subframe_data, pitches)
-                all_samples.extend(samples)
+                frame_out[:] = samples
             except Exception as e:
                 # On frame error, output silence for this frame
-                all_samples.extend([0.0] * self.samples_per_frame)
+                frame_out[:] = 0.0
 
-        return all_samples
+        return out
 
-    def _decode_qp_frames(self, segments: List[Tuple[bytes, int]], total_frames: int) -> List[float]:
+    def _decode_qp_frames(self, segments: List[Tuple[bytes, int]], total_frames: int) -> np.ndarray:
         """Decode QP frames from continuous bitstream segments."""
-        all_samples: List[float] = []
+        # Preallocated once from the clamped per-segment counts; frames are written in place.
+        out = np.empty(sum(seg_frames for _, seg_frames in segments) * self.samples_per_frame,
+                       dtype=np.float64)
+        frame_index = 0
         cb_bits = math.ceil(math.log2(
             math.comb(self.subframe_size, self.excitation_pulses)
         ))
@@ -750,8 +822,11 @@ class DS2Decoder:
             reader = BitstreamReader(stream)
             # Reset codec state for each segment (e.g. after a recording pause)
             self.reset()
-            
+
             for fi in range(seg_frames):
+                frame_out = out[frame_index * self.samples_per_frame:
+                                (frame_index + 1) * self.samples_per_frame]
+                frame_index += 1
                 try:
                     refl_indices = [reader.read_bits(b) for b in self.refl_bit_alloc]
 
@@ -773,14 +848,14 @@ class DS2Decoder:
                         })
 
                     samples = self._synthesize_frame(refl_indices, subframe_data, pitches)
-                    all_samples.extend(samples)
+                    frame_out[:] = samples
                 except Exception as e:
-                    all_samples.extend([0.0] * self.samples_per_frame)
+                    frame_out[:] = 0.0
 
-        return all_samples
+        return out
 
     def _synthesize_frame(self, refl_indices: List[int],
-                          subframe_data: List[Dict], pitches: List[int]) -> List[float]:
+                          subframe_data: List[Dict], pitches: List[int]) -> np.ndarray:
         """
         Synthesize one speech frame from decoded parameters.
 
@@ -795,7 +870,7 @@ class DS2Decoder:
             refl_indices, self.codebook, self.num_coeffs
         )
 
-        all_output: List[float] = []
+        all_output: List[np.ndarray] = []
         for sf in range(self.num_subframes):
             sd = subframe_data[sf]
             pitch = pitches[sf]
@@ -835,9 +910,88 @@ class DS2Decoder:
             self.pitch_memory = np.roll(self.pitch_memory, -self.subframe_size)
             self.pitch_memory[-self.subframe_size:] = excitation
 
-            all_output.extend(output.tolist())
+            all_output.append(output)
 
-        return all_output
+        return np.concatenate(all_output)
+
+
+# =============================================================================
+# Output Files
+# =============================================================================
+
+_TEMP_CREATE_ATTEMPTS = 5
+
+
+def _create_temp_beside(final_path: str) -> Tuple[int, str]:
+    """Create a new temp file in final_path's directory and return (fd, path).
+
+    O_EXCL means an existing file or symlink at the random name is never opened.
+    The mode is 0o666, so the OS applies the process umask as it does for any new file.
+    """
+    directory = os.path.dirname(os.path.abspath(final_path))
+    # The output name is left out of the temp name so a long output name cannot
+    # push it past the filesystem's name length limit.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+    for _ in range(_TEMP_CREATE_ATTEMPTS):
+        tmp_path = os.path.join(directory, f'.ds2-{secrets.token_hex(8)}.tmp')
+        try:
+            return os.open(tmp_path, flags, 0o666), tmp_path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"could not create a unique temporary file in {directory}")
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _existing_output_mode(final_path: str) -> Optional[int]:
+    """Mode of the existing regular file at final_path, or None if there is none.
+
+    A symlink is not followed, so the mode of its target is never copied.
+    """
+    try:
+        st = os.lstat(final_path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISREG(st.st_mode):
+        return stat.S_IMODE(st.st_mode)
+    return None
+
+
+def _apply_output_mode(tmp_path: str, final_path: str) -> None:
+    # Only an existing regular file needs its mode restored. A new file keeps the
+    # umask default from creation. Windows only honours the read-only bit, so skip it.
+    if os.name == 'nt':
+        return
+    mode = _existing_output_mode(final_path)
+    if mode is not None:
+        os.chmod(tmp_path, mode)
+
+
+def write_wav(wav_path: str, samples: np.ndarray, sample_rate: int) -> None:
+    """
+    Write mono int16 samples to a WAV file.
+
+    Writes to a temp file and renames it into place, so an existing symlink at
+    wav_path is replaced rather than written through.
+    """
+    fd, tmp_path = _create_temp_beside(wav_path)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            with wave.open(f, 'wb') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(samples.tobytes())
+        _apply_output_mode(tmp_path, wav_path)
+        os.replace(tmp_path, wav_path)
+    except BaseException:
+        _remove_quietly(tmp_path)
+        raise
 
 
 # =============================================================================
@@ -873,29 +1027,39 @@ def encode_pcm_to_mp3(pcm_samples: np.ndarray, sample_rate: int,
     mp3_data = encoder.encode(pcm_samples.tobytes())
     mp3_data += encoder.flush()
 
-    with open(output_path, 'wb') as f:
-        f.write(mp3_data)
+    # Tag and rename the temp file, not output_path, so a symlink there is replaced
+    # rather than followed.
+    fd, tmp_path = _create_temp_beside(output_path)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(mp3_data)
 
-    # Write ID3 tags if metadata provided
-    if metadata:
-        try:
-            from mutagen.mp3 import MP3
-            from mutagen.id3 import ID3, TIT2, TPE1, TDRC, TCOM
+        # Write ID3 tags if metadata provided
+        if metadata:
+            try:
+                from mutagen.mp3 import MP3
+                from mutagen.id3 import ID3, TIT2, TPE1, TDRC, TCOM
 
-            audio = MP3(output_path)
-            if audio.tags is None:
-                audio.add_tags()
+                audio = MP3(tmp_path)
+                if audio.tags is None:
+                    audio.add_tags()
 
-            if 'title' in metadata:
-                audio.tags.add(TIT2(encoding=3, text=[metadata['title']]))
-            if 'artist' in metadata:
-                audio.tags.add(TPE1(encoding=3, text=[metadata['artist']]))
-            if 'date' in metadata:
-                audio.tags.add(TDRC(encoding=3, text=[metadata['date']]))
+                if 'title' in metadata:
+                    audio.tags.add(TIT2(encoding=3, text=[metadata['title']]))
+                if 'artist' in metadata:
+                    audio.tags.add(TPE1(encoding=3, text=[metadata['artist']]))
+                if 'date' in metadata:
+                    audio.tags.add(TDRC(encoding=3, text=[metadata['date']]))
 
-            audio.save()
-        except Exception as e:
-            print(f"  Warning: Could not write ID3 tags: {e}")
+                audio.save()
+            except Exception as e:
+                print(f"  Warning: Could not write ID3 tags: {e}")
+
+        _apply_output_mode(tmp_path, output_path)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        _remove_quietly(tmp_path)
+        raise
 
 
 def decode_ds2_to_wav(ds2_path: str, wav_path: str,
@@ -908,11 +1072,7 @@ def decode_ds2_to_wav(ds2_path: str, wav_path: str,
     decoder = DS2Decoder(codebook_dir=codebook_dir)
     samples, header = decoder.decode_file(ds2_path)
 
-    with wave.open(wav_path, 'w') as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(decoder.sample_rate)
-        w.writeframes(samples.tobytes())
+    write_wav(wav_path, samples, decoder.sample_rate)
 
     return samples, header
 
